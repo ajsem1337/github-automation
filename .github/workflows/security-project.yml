@@ -1,0 +1,29 @@
+name: Security project monitor
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-project-monitor
+  cancel-in-progress: false
+
+jobs:
+  synchronize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify synchronization rules
+        run: python3 -m unittest discover -s automation -p 'test_security_project_sync.py' -v
+      - name: Synchronize private project
+        env:
+          GH_TOKEN: ${{ secrets.SECURITY_PROJECT_TOKEN }}
+        run: python3 automation/security_project_sync.py --owner ajsem1337 --project 1 --apply
+
