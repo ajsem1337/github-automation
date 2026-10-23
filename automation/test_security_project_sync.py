@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from security_project_sync import (
-    APIError, DONE, Finding, GitHub, OPEN, Project, alert_finding,
+    ACTIVE, APIError, DONE, Finding, GitHub, OPEN, Project, alert_finding,
     desired_status, managed_key, refresh_missing, workflow_finding,
     synchronize,
 )
@@ -42,6 +42,12 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(desired_status({"Status": "W trakcie", "Stan źródła": OPEN}, DONE), "Gotowe")
         self.assertEqual(desired_status({"Status": "Gotowe", "Stan źródła": DONE}, OPEN), "Do zrobienia")
 
+    def test_monitor_card_stays_in_progress_instead_of_becoming_a_todo(self):
+        for previous in ({}, {"Status": "Do zrobienia", "Stan źródła": OPEN},
+                         {"Status": "Gotowe", "Stan źródła": DONE}):
+            with self.subTest(previous=previous):
+                self.assertEqual(desired_status(previous, ACTIVE), "W trakcie")
+
     def test_unavailable_source_does_not_become_resolved(self):
         api = Mock()
         api.call.side_effect = APIError("403")
@@ -64,6 +70,11 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(project.upsert.call_count, 1)
         health = project.upsert.call_args.args[0]
         self.assertEqual(health.key, "monitor:health")
+        self.assertEqual(health.state, ACTIVE)
+        self.assertIn("Brak otwartych zgłoszeń w źródłach, które udało się odczytać.", health.body)
+        self.assertIn("403", health.body)
+        self.assertIn("To NIE oznacza braku podatności", health.body)
+        self.assertIn("osobne pozycje Do zrobienia", health.body)
         self.assertIn("o/private", health.body)
         self.assertNotIn("o/private", public_log.call_args.args[0])
 
@@ -112,4 +123,5 @@ class SecurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 

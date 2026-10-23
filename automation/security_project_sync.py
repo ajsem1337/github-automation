@@ -56,6 +56,7 @@ class GitHub:
 
 
 OPEN = "Otwarte"
+ACTIVE = "Aktywny"
 DONE = "Rozwiązane"
 TERMINAL = {DONE, "Zamknięte", "Scalone"}
 FIELDS = ["ID monitora", "Repozytorium", "Typ zgłoszenia", "Stan źródła", "Ważność"]
@@ -205,6 +206,8 @@ def managed_key(item):
 
 
 def desired_status(old, state, todo="Do zrobienia", done="Gotowe"):
+    if state == ACTIVE:
+        return "W trakcie"
     if state in TERMINAL:
         return done
     if old.get("Stan źródła") in TERMINAL or not old.get("Status"):
@@ -234,8 +237,8 @@ class Project:
     def setup(self):
         status = self.fields.get("Status", {})
         self.status_options = {o["name"]: o["id"] for o in status.get("options", [])}
-        if not {"Do zrobienia", "Gotowe"} <= self.status_options.keys():
-            raise RuntimeError("Brakuje statusów Do zrobienia / Gotowe; bez zmian.")
+        if not {"Do zrobienia", "W trakcie", "Gotowe"} <= self.status_options.keys():
+            raise RuntimeError("Brakuje statusów Do zrobienia / W trakcie / Gotowe; bez zmian.")
         for name in FIELDS:
             if name in self.fields:
                 if self.fields[name].get("dataType") != "TEXT":
@@ -334,11 +337,17 @@ def synchronize(api, owner, number, apply=False):
     for finding in findings:
         counts[project.upsert(finding)] += 1
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    body = f"Ostatnia synchronizacja: {timestamp}\n\nRepozytoria: {len(repos)}\n\n"
-    body += "Otwarte pozycje odczytane w tym przebiegu:\n"
-    for kind, count in sorted(Counter(f.kind for f in findings if f.state == OPEN).items()):
+    body = "To karta stanu monitora. Nie wymaga oznaczania jako wykonana.\n\n"
+    body += f"Ostatnie odświeżenie: {timestamp}\n\nRepozytoria: {len(repos)}\n\n"
+    body += "Otwarte zgłoszenia w odczytanych źródłach:\n"
+    open_counts = Counter(f.kind for f in findings if f.state == OPEN)
+    for kind, count in sorted(open_counts.items()):
         body += f"- {kind}: {count}\n"
-    body += "\nZakres i brakujące uprawnienia / niedostępne funkcje:\n"
+    if not open_counts:
+        body += "Brak otwartych zgłoszeń w źródłach, które udało się odczytać.\n"
+    body += ("\nCo dalej: harmonogram odświeża tę kartę co 6 godzin. Nowe PR-y i alerty "
+             "pojawią się jako osobne pozycje Do zrobienia, do przejrzenia i decyzji o poprawce.\n")
+    body += "\nOgraniczenia zakresu / błędy odczytu:\n"
     body += "\n".join(f"- {repo}: {source} — {status}" for repo, source, status in sorted(set(coverage))) or "Brak błędów odczytu."
     body += ("\n\n403/404 oznacza brak dostępu, wyłączoną funkcję albo funkcję niedostępną w planie. "
              "To NIE oznacza braku podatności. Błąd odczytu nie zamyka istniejących pozycji.\n\n"
@@ -346,7 +355,7 @@ def synchronize(api, owner, number, apply=False):
              "nie zmienia kodu ani nie odrzuca alertów. Historia pozostaje w projekcie. "
              "Alert i naprawiający go PR mogą być osobnymi pozycjami.\n\n"
              "Uruchomienia: https://github.com/ajsem1337/github-automation/actions/workflows/security-project.yml")
-    project.upsert(Finding("monitor:health", "", "Stan monitoringu", "Monitoring bezpieczeństwa — ostatnia synchronizacja", body))
+    project.upsert(Finding("monitor:health", "", "Stan monitoringu", "Monitoring bezpieczeństwa — stan", body, state=ACTIVE))
     # Only counts go to public workflow logs; repository names/details stay private.
     print(json.dumps({"mode": "apply" if apply else "preview", "repositories": len(repos),
                       "items": dict(counts), "unavailable_sources": len(coverage)}, ensure_ascii=False))
@@ -370,4 +379,5 @@ if __name__ == "__main__":
         # Exceptions above deliberately contain no API payloads.
         print(str(error))
         raise SystemExit(1) from None
+
 
