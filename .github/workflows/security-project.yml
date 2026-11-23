@@ -25,4 +25,12 @@ jobs:
       - name: Synchronize private project
         env:
           GH_TOKEN: ${{ secrets.SECURITY_PROJECT_TOKEN }}
-        run: python3 automation/security_project_sync.py --owner ajsem1337 --project 1 --exclude-repo ajsem1337/community-plugins --apply
+        run: >-
+          python3 automation/security_project_sync.py --owner ajsem1337 --project 1 --apply
+          --exclude-repo ajsem1337/community-plugins
+          --exclude-repo ajsem1337/system-health
+          --unsupported-source ajsem1337/ajsem1337:dependabot-prs
+          --unsupported-source ajsem1337/obs-setup:code-scanning-alerts
+          --unsupported-source ajsem1337/obs-setup:secret-scanning-alerts
+          --unsupported-source ajsem1337/webapp:code-scanning-alerts
+          --unsupported-source ajsem1337/webapp:secret-scanning-alerts
