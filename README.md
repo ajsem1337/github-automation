@@ -11,8 +11,10 @@ Use `--exclude-repo OWNER/REPO` to skip a repository without closing or dismissi
 its alerts; the option can be repeated. Exclusions appear on the private monitor
 health card, rather than in the public log.
 
-The single `monitor:health` card reports source counts (`ok`, `degraded`,
-`unavailable`, `unsupported`), the last completed sync, and each non-ok source's
+The single `monitor:health` card uses Markdown sections and wrapping lists for
+the summary, source counts (`ok`, `degraded`, `unavailable`, `unsupported`),
+sources needing attention, owner-marked unsupported sources, exclusions and notes.
+It reports the last completed sync and each degraded or unavailable source's
 reason and last successful check. Successful empty lists count as `ok`; 403/404
 means unavailable, not unsupported. Use `--unsupported-source OWNER/REPO:SOURCE`
 (for example `OWNER/REPO:code-scanning-alerts`) to report a capability the owner
@@ -33,6 +35,32 @@ Exhausted history, disabled workflows and workflows absent from inventory preser
 existing findings and appear on the health card. Reusable workflows whose only
 trigger is `workflow_call` record no runs of their own and are skipped when they
 have no runs.
+
+After the health card is written in `--apply` mode, the project badge becomes
+`OFF_TRACK` if repository discovery failed or any source is unavailable;
+otherwise `AT_RISK` if any source is degraded, an open finding was observed, or
+an existing open finding remains unverified; otherwise `ON_TRACK`. A short status
+update points to **Security monitoring — health**. Its hidden
+`<!-- security-project-status:v1 -->` marker prevents another update when the
+latest update belongs to this monitor and already has the same status. If the
+latest update cannot be read, posting is skipped and the public counts log sets
+`status_update_read_failed` to `true`; the sync continues. Mutations are attempted
+once. Preview mode never posts status updates.
+
+After finding and health writes, `--apply` archives at most 50 monitor-managed
+finding cards per run whose `Status` is `Gotowe`, whose `Stan źródła` is terminal
+(`Rozwiązane`, `Zamknięte` or `Scalone`), and whose item `updatedAt` is strictly
+older than 30 days. Cards changed during the sync, the health card, manual cards
+(including review and release cards) and already archived items are skipped.
+The public log's `archived` count reports completed archives in apply mode and
+would-be archives in preview mode; preview does not mutate the project.
+
+GitHub's [ProjectV2 schema reference](https://docs.github.com/en/graphql/reference/projects#projectv2)
+documents that `items` defaults to `archivedStates: [NOT_ARCHIVED]`. The monitor
+also ignores any returned item with `isArchived` set. Terminal findings without
+a visible item are already ignored, so archived resolved findings are not
+recreated on the next run. A reopened alert after archival may appear as a new
+card.
 
 At the owner's request, the scheduled workflow excludes the unused
 `ajsem1337/community-plugins` fork, which contains the full catalog of third-party

@@ -2,7 +2,7 @@ import base64
 import json
 import subprocess
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -11,7 +11,39 @@ from security_project_sync import (
     desired_status, managed_key, refresh_missing, workflow_finding,
     SOURCE_STATES, STATE_MARKER, SourceState, collect_repo, collect_workflow,
     failed_source, health_finding, reusable_only, source_history, synchronize,
+    AT_RISK, CLOSED, COMPLETE, FIELDS, HEALTH_KEY, MERGED, OFF_TRACK, ON_TRACK,
+    STATUS_MARKER, STATUS_UPDATES_QUERY, overall_status,
 )
+
+
+def project_with_items(items=(), apply=True):
+    api = Mock()
+    fields = [{"id": name, "name": name, "dataType": "TEXT"} for name in FIELDS]
+    fields.append({"id": "status", "name": "Status", "options": [
+        {"id": value, "name": value} for value in ("Do zrobienia", "W trakcie", COMPLETE)]})
+    api.gql.side_effect = [
+        {"user": {"projectV2": {"id": "project", "public": False, "fields": {"nodes": fields}}}},
+        {"node": {"items": {"nodes": list(items), "pageInfo": {"hasNextPage": False}}}},
+    ]
+    project = Project(api, "o", 1, apply)
+    project.setup()
+    api.gql.reset_mock(side_effect=True)
+    api.gql.return_value = {}
+    return project
+
+
+def completed_item(key="dependabot:o/private:1", state=DONE, status=COMPLETE,
+                   updated_at="2026-10-23T12:00:00Z", archived=False):
+    finding = Finding(key or "manual", "o/private", "Dependabot alert", "title", "body", state=state)
+    values = dict(finding.fields(), Status=status)
+    if key is None:
+        del values["ID monitora"]
+    return {"id": key or "manual", "isArchived": archived, "updatedAt": updated_at,
+            "content": {"id": "draft:" + (key or "manual"), "title": finding.title,
+                        "body": finding.draft_body() if key else "Manual card"},
+            "fieldValues": {"nodes": [
+                {"field": {"name": name}, "name" if name == "Status" else "text": value}
+                for name, value in values.items()]}}
 
 
 class SecurityTests(unittest.TestCase):
@@ -65,6 +97,8 @@ class SecurityTests(unittest.TestCase):
         old = {"Repozytorium": "o/private", "Stan źródła": OPEN, "Typ zgłoszenia": "Sekrety"}
         item = {"fieldValues": {"nodes": [{"text": value, "field": {"name": name}} for name, value in old.items()]}}
         project = Mock()
+        project.archive_completed.return_value = 0
+        project.update_status.return_value = True
         project.managed = {"secret-scanning:o/private:8": item}
         with patch("security_project_sync.Project", return_value=project), \
              patch("security_project_sync.collect_repo", return_value=([], [
@@ -100,6 +134,8 @@ class SecurityTests(unittest.TestCase):
             {"text": value, "field": {"name": name}} for name, value in old.items()
         ]}}
         project = Mock()
+        project.archive_completed.return_value = 0
+        project.update_status.return_value = True
         project.managed = {
             "code-scanning:o/excluded:1": item,
             # An interrupted draft may have its marker but no custom fields yet.
@@ -115,7 +151,7 @@ class SecurityTests(unittest.TestCase):
         project.upsert.assert_called_once()
         health = project.upsert.call_args.args[0]
         self.assertEqual(health.key, "monitor:health")
-        self.assertIn("excluded by the owner", health.body)
+        self.assertIn("## Excluded repositories", health.body)
         self.assertIn("o/excluded", health.body)
         self.assertNotIn("repository_inactive_or_inaccessible", health.body)
         counts = json.loads(public_log.call_args.args[0])
@@ -191,6 +227,8 @@ class SourceStateTests(unittest.TestCase):
 
     def sync(self, api, managed=None):
         project = Mock()
+        project.archive_completed.return_value = 0
+        project.update_status.return_value = True
         project.managed = dict(managed or {})
         project.upsert.return_value = "updated"
         with patch("security_project_sync.Project", return_value=project), patch("builtins.print") as public_log:
@@ -284,7 +322,7 @@ class SourceStateTests(unittest.TestCase):
             if "/contents/" in endpoint else {"workflow_runs": []})
         _, health, log = self.sync(api)
         self.assertNotIn("workflow:1", health.body.split("<!--")[0])
-        self.assertIn("All supported sources checked: yes", health.body)
+        self.assertIn("✅ All supported sources checked", health.body)
         self.assertIn("contents/.github/workflows/check.yml?ref=main",
                       [c.args[0] for c in api.call.call_args_list][-1])
 
@@ -315,12 +353,15 @@ class SourceStateTests(unittest.TestCase):
         project = Mock()
         project.managed = {}
         project.upsert.return_value = "updated"
+        project.archive_completed.return_value = 0
+        project.update_status.return_value = True
         with patch("security_project_sync.Project", return_value=project), patch("builtins.print") as public_log:
             synchronize(api, "o", 1, True, (), ["O/Private:code-scanning-alerts"])
         health = project.upsert.call_args.args[0]
-        self.assertIn("o/private:code-scanning-alerts; unsupported; owner_marked_unsupported", health.body)
-        self.assertIn("unavailable: 0; unsupported: 1", health.body)
-        self.assertIn("All supported sources checked: yes", health.body)
+        self.assertIn("- ➖ `o/private:code-scanning-alerts`", health.body)
+        self.assertIn("❌ unavailable: 0", health.body)
+        self.assertIn("➖ unsupported: 1", health.body)
+        self.assertIn("✅ All supported sources checked", health.body)
         self.assertEqual(json.loads(public_log.call_args.args[0])["sources"]["unsupported"], 1)
 
     def test_readable_unsupported_source_is_ok(self):
@@ -328,9 +369,11 @@ class SourceStateTests(unittest.TestCase):
         project = Mock()
         project.managed = {}
         project.upsert.return_value = "updated"
+        project.archive_completed.return_value = 0
+        project.update_status.return_value = True
         with patch("security_project_sync.Project", return_value=project), patch("builtins.print"):
             synchronize(api, "o", 1, True, (), ["o/private:code-scanning-alerts"])
-        self.assertIn("unsupported: 0", project.upsert.call_args.args[0].body)
+        self.assertIn("➖ unsupported: 0", project.upsert.call_args.args[0].body)
 
     def test_only_explicit_success_resolves_existing_workflow(self):
         api = self.api([self.workflow()])
@@ -339,7 +382,7 @@ class SourceStateTests(unittest.TestCase):
         self.assertEqual(project.upsert.call_count, 2)
         self.assertEqual(project.upsert.call_args_list[0].args[0].state, DONE)
         self.assertEqual(log["unverified_findings"], 0)
-        self.assertIn("All supported sources checked: yes", health.body)
+        self.assertIn("✅ All supported sources checked", health.body)
 
     def test_all_known_failures_open_workflow_findings(self):
         for conclusion in ("failure", "timed_out", "action_required", "startup_failure", "stale"):
@@ -374,9 +417,10 @@ class SourceStateTests(unittest.TestCase):
         self.assertEqual(len(states), 5)
         self.assertTrue(all(s.state == "ok" and s.last_success_at for s in states))
         _, health, _ = self.sync(api)
-        self.assertIn("ok: 6; degraded: 0; unavailable: 0; unsupported: 0", health.body)
+        for line in ("- ✅ ok: 6", "- ⚠️ degraded: 0", "- ❌ unavailable: 0", "- ➖ unsupported: 0"):
+            self.assertIn(line, health.body)
         self.assertIn("No open findings observed", health.body)
-        self.assertIn("All supported sources checked: yes", health.body)
+        self.assertIn("✅ All supported sources checked", health.body)
 
     def test_last_success_round_trip_and_degraded_run_keeps_old_value(self):
         api = self.api([self.workflow()])
@@ -389,7 +433,7 @@ class SourceStateTests(unittest.TestCase):
         _, degraded, _ = self.sync(api, {"monitor:health": self.item(ACTIVE, healthy.draft_body()),
                                        "workflow:o/private:1": self.item()})
         self.assertEqual(source_history(degraded.draft_body())["o/private:workflow:1"], previous)
-        self.assertIn(f"o/private:workflow:1; degraded; no_qualifying_run; {previous}", degraded.body)
+        self.assertIn(f"- ⚠️ `o/private:workflow:1` — no_qualifying_run — last success: {previous}", degraded.body)
         self.assertEqual(managed_key(self.item(ACTIVE, degraded.draft_body())), "monitor:health")
 
     def test_source_attempt_and_success_timestamps_and_unknown_history(self):
@@ -400,7 +444,7 @@ class SourceStateTests(unittest.TestCase):
         health = health_finding({source.source_id: source, failed.source_id: failed}, [], {},
                                "2026-11-23T11:00:00Z", 1, (), 1)
         self.assertEqual(failed.last_success_at, "")
-        self.assertIn("missing_or_inaccessible; unknown", health.body)
+        self.assertIn("missing_or_inaccessible — last success: unknown", health.body)
         self.assertIn('"o/private:workflow:1": ""', health.body)
         self.assertIn("Last completed sync: 2026-11-23T11:00:00Z", health.body)
 
@@ -413,7 +457,7 @@ class SourceStateTests(unittest.TestCase):
                 api = self.api([self.workflow()])
                 api.call.return_value = {"workflow_runs": []}
                 _, health, _ = self.sync(api, {"monitor:health": self.item(ACTIVE, body)})
-                self.assertIn("no_qualifying_run; unknown", health.body)
+                self.assertIn("no_qualifying_run — last success: unknown", health.body)
 
     def test_bare_403_and_404_are_unavailable_not_unsupported(self):
         for status in ("403", "404"):
@@ -438,13 +482,15 @@ class SourceStateTests(unittest.TestCase):
         project, health, log = self.sync(api, {"workflow:o/private:1": self.item()})
         api.call.assert_not_called()
         project.upsert.assert_called_once()
-        self.assertIn("repos; unavailable; http_503; unknown", health.body)
-        self.assertIn("All supported sources checked: no", health.body)
+        self.assertIn("- ❌ `repos` — http_503 — last success: unknown", health.body)
+        self.assertIn("⚠️ Some sources could not be checked", health.body)
         self.assertEqual(log["unverified_findings"], 1)
 
     def test_no_health_write_after_failed_finding_write(self):
         api = self.api([self.workflow()])
         project = Mock()
+        project.archive_completed.return_value = 0
+        project.update_status.return_value = True
         project.managed = {}
         project.upsert.side_effect = APIError("503")
         with patch("security_project_sync.Project", return_value=project), patch("builtins.print") as public_log:
@@ -453,6 +499,289 @@ class SourceStateTests(unittest.TestCase):
         project.upsert.assert_called_once()
         self.assertEqual(project.upsert.call_args.args[0].key, "workflow:o/private:1")
         public_log.assert_not_called()
+
+
+class PresentationTests(unittest.TestCase):
+    def test_health_sections_lists_and_hidden_history(self):
+        previous = "2026-10-01T12:00:00Z"
+        states = {s.source_id: s for s in (
+            SourceState("repos"), SourceState("o/private:workflow:2", "degraded", "workflow_disabled"),
+            failed_source("o/private:secret-scanning-alerts", APIError("403")),
+            SourceState("o/private:code-scanning-alerts", "unsupported", "owner_marked"))}
+        health = health_finding(states, [], {"o/private:workflow:2": previous},
+                                "2026-11-23T12:00:00Z", 1, ("o/excluded",), 2)
+        expected = [
+            "## Summary\n\n⚠️ Some sources could not be checked",
+            "- Last completed sync: 2026-11-23T12:00:00Z", "- Repositories: 1",
+            "- Open findings observed: 0.", "- Unverified existing open findings: 2.",
+            "- No open findings observed in successfully read sources.",
+            "## Sources\n\n- ✅ ok: 1\n- ⚠️ degraded: 1\n- ❌ unavailable: 1\n- ➖ unsupported: 1",
+            "## Needs attention\n\n- ❌ `o/private:secret-scanning-alerts` — http_403 — last success: unknown",
+            f"- ⚠️ `o/private:workflow:2` — workflow_disabled — last success: {previous}",
+            "## Unsupported\n\n- ➖ `o/private:code-scanning-alerts`",
+            "## Excluded repositories\n\n- `o/excluded`", "## Notes\n\n- 403/404 means unavailable",
+        ]
+        for text in expected:
+            self.assertIn(text, health.body)
+        self.assertNotIn("|", health.body)
+        self.assertEqual(source_history(health.draft_body())["o/private:workflow:2"], previous)
+        self.assertEqual(managed_key(SourceStateTests.item(ACTIVE, health.draft_body())), HEALTH_KEY)
+
+    def test_healthy_card_omits_optional_sections_and_empty_statement_when_findings_open(self):
+        finding = Finding("dependabot:o/private:1", "o/private", "Dependabot", "title", "body")
+        health = health_finding({"repos": SourceState("repos")}, [finding], {}, "now", 1, (), 0)
+        self.assertTrue(health.body.startswith("## Summary\n\n✅ All supported sources checked\n"))
+        self.assertIn("## Needs attention\n\nNone.", health.body)
+        self.assertIn("- Open findings observed: 1.", health.body)
+        for text in ("## Unsupported", "## Excluded repositories", "No open findings observed"):
+            self.assertNotIn(text, health.body)
+
+    def test_owner_marked_unsupported_source_is_separate_from_attention(self):
+        state = SourceState("o/private:code-scanning-alerts", "unsupported", "owner_marked")
+        health = health_finding({state.source_id: state}, [], {}, "now", 1, (), 0)
+        self.assertIn("✅ All supported sources checked", health.body)
+        self.assertIn("## Needs attention\n\nNone.", health.body)
+        self.assertIn("## Unsupported\n\n- ➖ `o/private:code-scanning-alerts`", health.body)
+
+
+class ProjectStatusTests(unittest.TestCase):
+    @staticmethod
+    def latest(status=ON_TRACK, body=STATUS_MARKER):
+        return {"status": status, "body": body, "createdAt": "2026-11-23T12:00:00Z"}
+
+    def test_status_computation_and_priority(self):
+        cases = [
+            ("ok", "ok", 0, 0, ON_TRACK), ("ok", "unsupported", 0, 0, ON_TRACK),
+            ("ok", "degraded", 0, 0, AT_RISK), ("ok", "ok", 1, 0, AT_RISK),
+            ("ok", "ok", 0, 1, AT_RISK), ("ok", "unavailable", 0, 0, OFF_TRACK),
+            ("degraded", "ok", 0, 0, OFF_TRACK), ("unavailable", "ok", 0, 0, OFF_TRACK),
+            ("ok", "unavailable", 1, 1, OFF_TRACK),
+        ]
+        for discovery, state, observed, unverified, expected in cases:
+            with self.subTest(case=(discovery, state, observed, unverified)):
+                states = {"repos": SourceState("repos", discovery), "source": SourceState("source", state)}
+                self.assertEqual(overall_status(states, observed, unverified), expected)
+
+    def test_post_on_status_change_manual_latest_or_no_updates(self):
+        cases = [([self.latest(ON_TRACK)], AT_RISK), ([self.latest(AT_RISK)], OFF_TRACK),
+                 ([self.latest(OFF_TRACK)], ON_TRACK), ([self.latest(body="Owner update")], ON_TRACK),
+                 ([self.latest(body=None)], ON_TRACK), ([], ON_TRACK)]
+        for updates, status in cases:
+            with self.subTest(updates=updates, status=status):
+                project = project_with_items()
+                project.api.gql.return_value = {"node": {"statusUpdates": {"nodes": updates}}}
+                self.assertTrue(project.update_status(status, {"repos": SourceState("repos")}, 2, 3))
+                self.assertEqual(project.api.gql.call_count, 2)
+                read, write = project.api.gql.call_args_list
+                self.assertEqual(read.args[0], STATUS_UPDATES_QUERY)
+                self.assertIn("first:1, orderBy:{field:CREATED_AT, direction:DESC}", read.args[0])
+                self.assertEqual(read.kwargs, {"id": "project"})
+                self.assertIn("createProjectV2StatusUpdate", write.args[0])
+                payload = write.kwargs["input"]
+                self.assertEqual(payload["projectId"], "project")
+                self.assertEqual(payload["status"], status)
+                self.assertIn("Open findings observed: 2; unverified: 3", payload["body"])
+                self.assertIn("Security monitoring — health", payload["body"])
+                lines = payload["body"].splitlines()
+                self.assertEqual(lines[-1], STATUS_MARKER)
+                self.assertGreaterEqual(len(lines[:-1]), 2)
+                self.assertLessEqual(len(lines[:-1]), 4)
+
+    def test_skip_unchanged_monitor_status_even_when_counts_change(self):
+        for status in (ON_TRACK, AT_RISK, OFF_TRACK):
+            with self.subTest(status=status):
+                project = project_with_items()
+                project.api.gql.return_value = {"node": {"statusUpdates": {"nodes": [self.latest(status)]}}}
+                self.assertTrue(project.update_status(status, {}, 7, 8))
+                project.api.gql.assert_called_once_with(STATUS_UPDATES_QUERY, id="project")
+
+    def test_preview_never_reads_or_posts_status(self):
+        project = project_with_items(apply=False)
+        self.assertTrue(project.update_status(ON_TRACK, {}, 0, 0))
+        project.api.gql.assert_not_called()
+
+    def test_read_failure_skips_posting_without_raising(self):
+        for response in (APIError("503"), {}, {"node": None},
+                         {"node": {"statusUpdates": {"nodes": None}}},
+                         {"node": {"statusUpdates": {"nodes": [{}]}}}):
+            with self.subTest(response=response):
+                project = project_with_items()
+                if isinstance(response, Exception):
+                    project.api.gql.side_effect = response
+                else:
+                    project.api.gql.return_value = response
+                self.assertFalse(project.update_status(ON_TRACK, {}, 0, 0))
+                project.api.gql.assert_called_once_with(STATUS_UPDATES_QUERY, id="project")
+
+    def test_failed_status_mutation_is_not_swallowed_or_repeated(self):
+        project = project_with_items()
+        project.api.gql.side_effect = [{"node": {"statusUpdates": {"nodes": []}}}, APIError("503")]
+        with self.assertRaises(APIError):
+            project.update_status(ON_TRACK, {}, 0, 0)
+        self.assertEqual(project.api.gql.call_count, 2)
+
+
+class ArchiveTests(unittest.TestCase):
+    NOW = datetime(2026, 11, 23, 12, tzinfo=timezone.utc)
+
+    def test_only_strictly_older_than_thirty_days(self):
+        boundary = self.NOW - timedelta(days=30)
+        timestamps = [(boundary - timedelta(seconds=1)).isoformat(), boundary.isoformat(),
+                      (boundary + timedelta(seconds=1)).isoformat(), self.NOW.isoformat(),
+                      "2026-10-24T14:00:00+02:00", "invalid", "2026-10-01T12:00:00", None]
+        items = [completed_item(f"dependabot:o/private:{i}", updated_at=ts) for i, ts in enumerate(timestamps)]
+        missing = completed_item("dependabot:o/private:missing")
+        del missing["updatedAt"]
+        project = project_with_items(items + [missing])
+        self.assertEqual(project.archive_completed(self.NOW), 1)
+        project.api.gql.assert_called_once()
+        self.assertEqual(project.api.gql.call_args.kwargs["input"],
+                         {"projectId": "project", "itemId": items[0]["id"]})
+
+    def test_all_managed_finding_kinds_and_terminal_states_are_eligible(self):
+        items = [completed_item(f"{kind}:o/private:{i}", state=state)
+                 for kind in ("pr", "dependabot", "code-scanning", "secret-scanning", "workflow")
+                 for i, state in enumerate((DONE, CLOSED, MERGED))]
+        project = project_with_items(items)
+        self.assertEqual(project.archive_completed(self.NOW), 15)
+        self.assertEqual(project.api.gql.call_count, 15)
+        self.assertTrue(all("archiveProjectV2Item" in call.args[0] for call in project.api.gql.call_args_list))
+
+    def test_nonterminal_health_manual_and_already_archived_items_are_skipped(self):
+        items = [completed_item(state=OPEN), completed_item(state=ACTIVE),
+                 completed_item(status="W trakcie"), completed_item(status="Do zrobienia"),
+                 completed_item(HEALTH_KEY), completed_item(None), completed_item("review:o/private:1"),
+                 completed_item("release:o/private:1"), completed_item(archived=True)]
+        project = project_with_items(items)
+        self.assertEqual(project.archive_completed(self.NOW), 0)
+        project.api.gql.assert_not_called()
+
+    def test_cap_fifty_and_preview_counts_without_mutations(self):
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                items = [completed_item(f"dependabot:o/private:{i}") for i in range(60)]
+                project = project_with_items(items, apply=apply)
+                self.assertEqual(project.archive_completed(self.NOW), 50)
+                self.assertEqual(project.api.gql.call_count, 50 if apply else 0)
+                self.assertEqual(sum(i["isArchived"] for i in items), 50 if apply else 0)
+
+    def test_changed_or_reopened_cards_are_not_archived_from_stale_snapshot(self):
+        for apply in (False, True):
+            for state in (OPEN, DONE):
+                with self.subTest(apply=apply, state=state):
+                    item = completed_item()
+                    project = project_with_items([item], apply=apply)
+                    finding = Finding(item["id"], "o/private", "Dependabot alert", "changed", "body", state=state)
+                    self.assertEqual(project.upsert(finding), "updated")
+                    project.api.gql.reset_mock()
+                    self.assertEqual(project.archive_completed(self.NOW), 0)
+                    project.api.gql.assert_not_called()
+
+    def test_unchanged_old_terminal_card_can_still_be_archived(self):
+        item = completed_item()
+        project = project_with_items([item])
+        finding = Finding(item["id"], "o/private", "Dependabot alert", "title", "body", state=DONE)
+        self.assertEqual(project.upsert(finding), "updated")
+        project.api.gql.assert_not_called()
+        self.assertEqual(project.archive_completed(self.NOW), 1)
+
+    def test_archived_rows_do_not_override_visible_items_or_block_reopened_native_cards(self):
+        visible = completed_item()
+        archived = completed_item(archived=True)
+        archived["content"]["id"] = "archived-draft"
+        native = completed_item("pr:o/private:2", archived=True)
+        native["content"]["id"] = "archived-pr"
+        project = project_with_items([visible, archived, native])
+        self.assertIs(project.managed[visible["id"]], visible)
+        self.assertNotIn(native["id"], project.managed)
+        self.assertNotIn("archived-draft", project.content_ids)
+        self.assertNotIn("archived-pr", project.content_ids)
+
+    def test_archived_or_absent_resolved_finding_is_not_recreated_on_next_run(self):
+        for items in ([], [completed_item(archived=True)]):
+            for apply in (False, True):
+                with self.subTest(items=bool(items), apply=apply):
+                    project = project_with_items(items, apply=apply)
+                    finding = Finding("dependabot:o/private:1", "o/private", "Dependabot alert", "title", "body", state=DONE)
+                    self.assertEqual(project.upsert(finding), "ignored")
+                    project.api.gql.assert_not_called()
+
+    def test_reopened_alert_after_archival_can_create_new_card(self):
+        project = project_with_items([completed_item(archived=True)])
+        finding = Finding("dependabot:o/private:1", "o/private", "Dependabot alert", "title", "body")
+        project.api.gql.side_effect = [
+            {"addProjectV2DraftIssue": {"projectItem": {"id": "new-item"}}}, *([{}] * 6)]
+        self.assertEqual(project.upsert(finding), "created")
+        self.assertIn("addProjectV2DraftIssue", project.api.gql.call_args_list[0].args[0])
+        self.assertEqual(project.managed[finding.key]["id"], "new-item")
+
+    def test_archive_mutation_failure_is_not_repeated(self):
+        project = project_with_items([completed_item()])
+        project.api.gql.side_effect = APIError("503")
+        with self.assertRaises(APIError):
+            project.archive_completed(self.NOW)
+        project.api.gql.assert_called_once()
+
+
+class PresentationSyncTests(unittest.TestCase):
+    def test_status_read_failure_continues_to_archives_and_counts_only_log(self):
+        project = project_with_items([completed_item()])
+        project.api.pages.return_value = []
+        project.api.gql.side_effect = [APIError("503"), {}]
+        project.upsert = Mock(return_value="updated")
+        with patch("security_project_sync.Project", return_value=project), \
+                patch("security_project_sync.datetime", wraps=datetime) as clock, \
+                patch("builtins.print") as public_log:
+            clock.now.return_value = ArchiveTests.NOW
+            synchronize(project.api, "o", 1, True)
+        log = json.loads(public_log.call_args.args[0])
+        self.assertIs(log["status_update_read_failed"], True)
+        self.assertEqual(log["archived"], 1)
+        self.assertEqual(project.api.gql.call_count, 2)
+        self.assertIn("archiveProjectV2Item", project.api.gql.call_args.args[0])
+        for private in ("o/private", "http_503", "Security monitoring", STATUS_MARKER):
+            self.assertNotIn(private, public_log.call_args.args[0])
+
+    def test_preview_counts_archives_and_skips_status_entirely(self):
+        project = project_with_items([completed_item()], apply=False)
+        project.api.pages.return_value = []
+        project.upsert = Mock(return_value="updated")
+        project.update_status = Mock()
+        with patch("security_project_sync.Project", return_value=project), \
+                patch("security_project_sync.datetime", wraps=datetime) as clock, \
+                patch("builtins.print") as public_log:
+            clock.now.return_value = ArchiveTests.NOW
+            synchronize(project.api, "o", 1)
+        log = json.loads(public_log.call_args.args[0])
+        self.assertEqual(log["mode"], "preview")
+        self.assertEqual(log["archived"], 1)
+        self.assertIs(log["status_update_read_failed"], False)
+        project.update_status.assert_not_called()
+        project.api.gql.assert_not_called()
+
+    def test_status_and_archive_follow_successful_health_write_only(self):
+        for failed_health in (False, True):
+            with self.subTest(failed_health=failed_health):
+                api = Mock()
+                api.pages.return_value = []
+                project = Mock()
+                project.managed = {}
+                project.archive_completed.return_value = 0
+                project.update_status.return_value = True
+                if failed_health:
+                    project.upsert.side_effect = APIError("503")
+                with patch("security_project_sync.Project", return_value=project), patch("builtins.print"):
+                    if failed_health:
+                        with self.assertRaises(APIError):
+                            synchronize(api, "o", 1, True)
+                        project.update_status.assert_not_called()
+                        project.archive_completed.assert_not_called()
+                    else:
+                        synchronize(api, "o", 1, True)
+                        self.assertEqual([call[0] for call in project.method_calls],
+                                         ["setup", "upsert", "update_status", "archive_completed"])
+                        self.assertEqual(project.upsert.call_args.args[0].key, HEALTH_KEY)
+                        self.assertEqual(project.update_status.call_args.args[0], ON_TRACK)
 
 
 class RetryTests(unittest.TestCase):
