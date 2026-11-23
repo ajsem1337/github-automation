@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Synchronize security metadata to a PRIVATE user Project. Python stdlib + gh CLI."""
 import argparse
+import base64
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -285,6 +286,39 @@ def workflow_finding(repo, workflow, run):
                    DONE if conclusion == "success" else OPEN)
 
 
+def reusable_only(text):
+    # Reusable workflows that only declare workflow_call never record runs of their own.
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"""^(?:on|"on"|'on'):[ \t]*([^#]*)""", line)
+        if not match:
+            continue
+        if match.group(1).strip():
+            return set(re.findall(r"[A-Za-z_]+", match.group(1))) == {"workflow_call"}
+        keys, indent = set(), None
+        for child in lines[index + 1:]:
+            if not child.strip() or child.lstrip().startswith("#"):
+                continue
+            if not child[0].isspace():
+                break
+            width = len(child) - len(child.lstrip())
+            indent = width if indent is None else indent
+            if width == indent:
+                key = re.match(r"\s*(?:-\s*)?([A-Za-z_]+)", child)
+                keys.add(key.group(1) if key else "?")
+        return keys == {"workflow_call"}
+    return False
+
+
+def is_reusable_workflow(api, repo, workflow):
+    try:
+        data = api.call(f"repos/{repo['full_name']}/contents/{workflow['path']}?" +
+                        urlencode({"ref": repo["default_branch"]}))
+        return reusable_only(base64.b64decode(data["content"]).decode("utf-8"))
+    except (APIError, KeyError, TypeError, ValueError):
+        return False
+
+
 def collect_workflow(api, repo, workflow):
     name, workflow_id = repo["full_name"], workflow["id"]
     source_id = f"{name}:workflow:{workflow_id}"
@@ -304,6 +338,8 @@ def collect_workflow(api, repo, workflow):
                 return None, SourceState(source_id, "degraded", "unknown_conclusion")
             return finding, SourceState(source_id)
         if len(runs) < 100:
+            if page == 1 and not runs and is_reusable_workflow(api, repo, workflow):
+                return None, None
             return None, SourceState(source_id, "degraded", "no_qualifying_run")
     return None, SourceState(source_id, "degraded", "history_cap_exhausted")
 
@@ -344,7 +380,8 @@ def collect_repo(api, repo):
             finding, state = collect_workflow(api, repo, workflow)
             if finding:
                 found.append(finding)
-            states.append(state)
+            if state:
+                states.append(state)
         except APIError as exc:
             states.append(failed_source(source_id, exc))
         except (KeyError, TypeError, ValueError):
@@ -504,8 +541,8 @@ def health_finding(states, findings, history, completed_at, repo_count, excluded
     body += f"Open findings observed: {open_count}.\n"
     if not open_count:
         body += "No open findings observed in successfully read sources.\n"
-    all_checked = all(source.state == "ok" for source in states.values())
-    body += f"All sources checked: {'yes' if all_checked else 'no'}.\n"
+    all_checked = all(source.state in {"ok", "unsupported"} for source in states.values())
+    body += f"All supported sources checked: {'yes' if all_checked else 'no'}.\n"
     body += f"Unverified existing open findings: {unverified}.\n\n"
     body += "Non-ok sources (source; state; reason; last success):\n"
     non_ok = [source for source in states.values() if source.state != "ok"]
@@ -522,14 +559,20 @@ def health_finding(states, findings, history, completed_at, repo_count, excluded
     return Finding(HEALTH_KEY, "", "Monitor health", "Security monitoring — health", body, state=ACTIVE)
 
 
-def synchronize(api, owner, number, apply=False, excluded_repos=()):
+def synchronize(api, owner, number, apply=False, excluded_repos=(), unsupported_sources=()):
     excluded_repos = {name.lower() for name in excluded_repos}
+    unsupported_sources = {name.lower() for name in unsupported_sources}
     project = Project(api, owner, number, apply)
     health_item = project.managed.get(HEALTH_KEY, {})
     history = source_history((health_item.get("content") or {}).get("body", ""))
     states = {}
 
     def record(source):
+        # Owner-declared unsupported capabilities are reported as such while unreadable;
+        # a successful read still counts as ok.
+        if source.state != "ok" and source.source_id.lower() in unsupported_sources:
+            source = SourceState(source.source_id, "unsupported", "owner_marked_unsupported",
+                                 source.last_attempt_at)
         previous = states.get(source.source_id)
         # A successful individual refresh cannot repair a failed collection read.
         if previous is None or source.state != "ok":
@@ -619,10 +662,12 @@ def main():
     parser.add_argument("--apply", action="store_true", help="Write to Project; default is read-only preview")
     parser.add_argument("--exclude-repo", action="append", default=[], metavar="OWNER/REPO",
                         help="Exclude a repository without dismissing its alerts; may be repeated")
+    parser.add_argument("--unsupported-source", action="append", default=[], metavar="SOURCE_ID",
+                        help="Report an unreadable source as unsupported, e.g. OWNER/REPO:code-scanning-alerts; may be repeated")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") == "true" and not os.environ.get("GH_TOKEN"):
         raise RuntimeError("Add the SECURITY_PROJECT_TOKEN secret in the repository Actions settings.")
-    synchronize(GitHub(), args.owner, args.project, args.apply, args.exclude_repo)
+    synchronize(GitHub(), args.owner, args.project, args.apply, args.exclude_repo, args.unsupported_source)
 
 
 if __name__ == "__main__":

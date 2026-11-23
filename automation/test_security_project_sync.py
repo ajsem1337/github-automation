@@ -1,3 +1,4 @@
+import base64
 import json
 import subprocess
 import unittest
@@ -9,7 +10,7 @@ from security_project_sync import (
     ACTIVE, APIError, DONE, Finding, GitHub, OPEN, Project, alert_finding,
     desired_status, managed_key, refresh_missing, workflow_finding,
     SOURCE_STATES, STATE_MARKER, SourceState, collect_repo, collect_workflow,
-    failed_source, health_finding, source_history, synchronize,
+    failed_source, health_finding, reusable_only, source_history, synchronize,
 )
 
 
@@ -268,8 +269,68 @@ class SourceStateTests(unittest.TestCase):
         api.call.return_value = {"workflow_runs": []}
         project, health, _ = self.sync(api, {"workflow:o/private:1": self.item()})
         project.upsert.assert_called_once()
-        self.assertEqual(api.call.call_count, 1)
+        # Runs read plus the workflow file check for reusable workflows.
+        self.assertEqual(api.call.call_count, 2)
         self.assertIn("no_qualifying_run", health.body)
+
+    @staticmethod
+    def contents(text):
+        return {"content": base64.b64encode(text.encode()).decode()}
+
+    def test_reusable_only_workflow_is_skipped(self):
+        api = self.api([self.workflow()])
+        api.call.side_effect = lambda endpoint: (
+            self.contents("name: Check\n\non:\n  workflow_call:\n    inputs:\n      x:\n        type: string\n")
+            if "/contents/" in endpoint else {"workflow_runs": []})
+        _, health, log = self.sync(api)
+        self.assertNotIn("workflow:1", health.body.split("<!--")[0])
+        self.assertIn("All supported sources checked: yes", health.body)
+        self.assertIn("contents/.github/workflows/check.yml?ref=main",
+                      [c.args[0] for c in api.call.call_args_list][-1])
+
+    def test_reusable_detection_requires_only_workflow_call(self):
+        for text, expected in (
+                ("on:\n  workflow_call:\n", True),
+                ("on: workflow_call\n", True),
+                ("'on': [workflow_call]  # reusable\n", True),
+                ("on:\n  - workflow_call\n", True),
+                ("on:\n  workflow_call:\n  push:\n    branches: [main]\n", False),
+                ("on: [push, workflow_call]\n", False),
+                ("on:\n  workflow_dispatch:\n", False),
+                ("name: x\njobs: {}\n", False)):
+            with self.subTest(text=text):
+                self.assertEqual(reusable_only(text), expected)
+
+    def test_unreadable_workflow_file_keeps_degraded(self):
+        api = self.api([self.workflow()])
+        api.call.side_effect = lambda endpoint: (_ for _ in ()).throw(APIError("404")) if "/contents/" in endpoint else {"workflow_runs": []}
+        _, health, _ = self.sync(api)
+        self.assertIn("no_qualifying_run", health.body)
+
+    def test_owner_marked_unsupported_source(self):
+        api = self.api()
+        api.pages.side_effect = lambda endpoint, **params: (
+            [self.repo()] if endpoint == "user/repos" else
+            (_ for _ in ()).throw(APIError("403")) if "code-scanning" in endpoint else [])
+        project = Mock()
+        project.managed = {}
+        project.upsert.return_value = "updated"
+        with patch("security_project_sync.Project", return_value=project), patch("builtins.print") as public_log:
+            synchronize(api, "o", 1, True, (), ["O/Private:code-scanning-alerts"])
+        health = project.upsert.call_args.args[0]
+        self.assertIn("o/private:code-scanning-alerts; unsupported; owner_marked_unsupported", health.body)
+        self.assertIn("unavailable: 0; unsupported: 1", health.body)
+        self.assertIn("All supported sources checked: yes", health.body)
+        self.assertEqual(json.loads(public_log.call_args.args[0])["sources"]["unsupported"], 1)
+
+    def test_readable_unsupported_source_is_ok(self):
+        api = self.api()
+        project = Mock()
+        project.managed = {}
+        project.upsert.return_value = "updated"
+        with patch("security_project_sync.Project", return_value=project), patch("builtins.print"):
+            synchronize(api, "o", 1, True, (), ["o/private:code-scanning-alerts"])
+        self.assertIn("unsupported: 0", project.upsert.call_args.args[0].body)
 
     def test_only_explicit_success_resolves_existing_workflow(self):
         api = self.api([self.workflow()])
@@ -278,7 +339,7 @@ class SourceStateTests(unittest.TestCase):
         self.assertEqual(project.upsert.call_count, 2)
         self.assertEqual(project.upsert.call_args_list[0].args[0].state, DONE)
         self.assertEqual(log["unverified_findings"], 0)
-        self.assertIn("All sources checked: yes", health.body)
+        self.assertIn("All supported sources checked: yes", health.body)
 
     def test_all_known_failures_open_workflow_findings(self):
         for conclusion in ("failure", "timed_out", "action_required", "startup_failure", "stale"):
@@ -315,7 +376,7 @@ class SourceStateTests(unittest.TestCase):
         _, health, _ = self.sync(api)
         self.assertIn("ok: 6; degraded: 0; unavailable: 0; unsupported: 0", health.body)
         self.assertIn("No open findings observed", health.body)
-        self.assertIn("All sources checked: yes", health.body)
+        self.assertIn("All supported sources checked: yes", health.body)
 
     def test_last_success_round_trip_and_degraded_run_keeps_old_value(self):
         api = self.api([self.workflow()])
@@ -378,7 +439,7 @@ class SourceStateTests(unittest.TestCase):
         api.call.assert_not_called()
         project.upsert.assert_called_once()
         self.assertIn("repos; unavailable; http_503; unknown", health.body)
-        self.assertIn("All sources checked: no", health.body)
+        self.assertIn("All supported sources checked: no", health.body)
         self.assertEqual(log["unverified_findings"], 1)
 
     def test_no_health_write_after_failed_finding_write(self):
