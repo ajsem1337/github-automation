@@ -11,6 +11,23 @@ Use `--exclude-repo OWNER/REPO` to skip a repository without closing or dismissi
 its alerts; the option can be repeated. Exclusions appear on the private monitor
 health card, rather than in the public log.
 
+The single `monitor:health` card reports source counts (`ok`, `degraded`,
+`unavailable`, `unsupported`), the last completed sync, and each non-ok source's
+reason and last successful check. Successful empty lists count as `ok`; 403/404
+means unavailable, not unsupported. A hidden JSON block preserves successful
+timestamps between syncs; missing history is shown as unknown. The card is
+written after finding updates succeed.
+
+“No open findings observed” only describes the sources read successfully.
+“All sources checked” requires every monitored source to be `ok`. Existing open
+findings from non-ok sources are counted as unverified and retain their state.
+Each workflow is checked independently across at most three pages of 100
+completed runs, on the default branch (any branch for GitHub dynamic scans).
+Cancelled, skipped and neutral runs are skipped; an unknown or missing conclusion
+preserves the finding. Only explicit success resolves a workflow finding.
+Exhausted history, disabled workflows and workflows absent from inventory preserve
+existing findings and appear on the health card.
+
 At the owner's request, the scheduled workflow excludes the unused
 `ajsem1337/community-plugins` fork, which contains the full catalog of third-party
 plugins. The owner's `ajsem1337/system-menu` repository remains monitored.
