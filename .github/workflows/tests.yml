@@ -16,4 +16,4 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: python3 -m unittest discover -s automation -p 'test_security_project_sync.py' -v
+      - run: python3 -B -m unittest discover -s automation -v
