@@ -1,29 +1,53 @@
 # GitHub automation
 
-![Made with AI](https://img.shields.io/badge/Made%20with-AI-76ddcf)
+![Made with AI](https://raw.githubusercontent.com/ajsem1337/ajsem1337/main/assets/made-with-ai.svg)
 
-Automatycznie zbiera aktualizacje zależności, alerty bezpieczeństwa i błędy automatyzacji z repozytoriów oraz aktualizuje ich statusy na tablicy GitHub Projects.
+Automatically collects dependency updates, security alerts and automation failures from repositories and updates their statuses on a GitHub Projects board.
 
-## Zakres
+## Scope
 
-Nowe aktywne repozytoria właściciela są wykrywane automatycznie. Parametr
-`--exclude-repo OWNER/REPO` pozwala jawnie pominąć repozytorium bez zamykania
-lub odrzucania alertów; można go podać wielokrotnie. Wyjątki są wymieniane na
-prywatnej karcie stanu monitora, nie w publicznym logu.
+New active repositories owned by the account are discovered automatically.
+Use `--exclude-repo OWNER/REPO` to skip a repository without closing or dismissing
+its alerts; the option can be repeated. Exclusions appear on the private monitor
+health card, rather than in the public log.
 
-Decyzją właściciela harmonogram pomija nieużywany fork
-`ajsem1337/community-plugins`, zawierający cały katalog cudzych wtyczek.
-Własne `ajsem1337/system-menu` pozostaje monitorowane.
+At the owner's request, the scheduled workflow excludes the unused
+`ajsem1337/community-plugins` fork, which contains the full catalog of third-party
+plugins. The owner's `ajsem1337/system-menu` repository remains monitored.
 
-## Prywatne repozytoria
+## Private repositories
 
-Współdzielony workflow `.github/workflows/secret-check.yml` uruchamia Gitleaks,
-gdy natywne skanowanie sekretów GitHuba nie jest dostępne w planie repozytorium.
-Wywołujące repo przypina workflow do pełnego SHA i udostępnia tylko
-`contents: read`; nie przekazuje sekretów. Skan obejmuje pobraną historię Git.
+The reusable `.github/workflows/secret-check.yml` workflow runs Gitleaks when
+native GitHub secret scanning is unavailable on a repository's plan.
+Calling repositories pin the workflow to a full commit SHA, grant only
+`contents: read` and pass no secrets. The scan covers the fetched Git history.
 
-Binarka Gitleaks ma przypiętą wersję i sprawdzaną sumę SHA-256. Raport jest
-redagowany i nie jest publikowany jako artefakt; log pokazuje wyłącznie
-identyfikator reguły, plik, linię i commit. Wykrycie lub błąd skanera kończy
-workflow niepowodzeniem, które istniejący monitor przenosi do prywatnego projektu.
-To nie zastępuje CodeQL ani nie dodaje natywnych alertów Secret Scanning.
+The Gitleaks binary has a pinned version and a verified SHA-256 checksum.
+The report is redacted and is not published as an artifact; finding details in
+the log are limited to the rule ID, file, line and commit. A finding or scanner
+error fails the workflow, which the existing monitor records in the private
+project. This does not replace CodeQL or create native Secret Scanning alerts.
+
+## Project status names
+
+The monitor requires an existing private user project. Keep these literal
+option values in its `Status` field; the code matches their Polish names exactly:
+
+| Value | Meaning |
+| --- | --- |
+| `Do zrobienia` | To do: new or reopened findings |
+| `W trakcie` | In progress: the active monitor health card |
+| `Gotowe` | Done: resolved, closed or merged source items |
+
+An open finding keeps its existing board status unless its source was previously
+resolved, closed or merged, or it has no board status. The source-state values are `Otwarte`
+(open), `Aktywny` (active), `Rozwiązane` (resolved), `Zamknięte` (closed) and
+`Scalone` (merged).
+
+The text fields also retain their exact names: `ID monitora` (monitor ID),
+`Repozytorium` (repository), `Typ zgłoszenia` (finding type), `Stan źródła`
+(source state) and `Ważność` (severity).
+
+---
+
+<p align="center"><sub>Built by <a href="https://github.com/ajsem1337">ajsem</a> with AI assistance.</sub></p>
