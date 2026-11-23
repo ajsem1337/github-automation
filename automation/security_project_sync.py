@@ -305,10 +305,12 @@ def refresh_missing(api, key):
     return None
 
 
-def synchronize(api, owner, number, apply=False):
+def synchronize(api, owner, number, apply=False, excluded_repos=()):
+    excluded_repos = {name.lower() for name in excluded_repos}
     project = Project(api, owner, number, apply)
     repos = [r for r in api.pages("user/repos", affiliation="owner")
-             if r["owner"]["login"].lower() == owner.lower() and not r["archived"] and not r["disabled"]]
+             if r["owner"]["login"].lower() == owner.lower() and not r["archived"] and not r["disabled"]
+             and r["full_name"].lower() not in excluded_repos]
     project.setup()
     findings, coverage = [], []
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -321,6 +323,10 @@ def synchronize(api, owner, number, apply=False):
         if key in present or key == "monitor:health":
             continue
         old = item_values(item)
+        key_parts = key.split(":", 2)
+        key_repo = key_parts[1].lower() if len(key_parts) == 3 else ""
+        if (old.get("Repozytorium") or "").lower() in excluded_repos or key_repo in excluded_repos:
+            continue
         if old.get("Stan źródła") in TERMINAL:
             continue
         # Removed/archived/inaccessible repositories keep their last known state.
@@ -347,6 +353,9 @@ def synchronize(api, owner, number, apply=False):
         body += "Brak otwartych zgłoszeń w źródłach, które udało się odczytać.\n"
     body += ("\nCo dalej: harmonogram odświeża tę kartę co 6 godzin. Nowe PR-y i alerty "
              "pojawią się jako osobne pozycje Do zrobienia, do przejrzenia i decyzji o poprawce.\n")
+    if excluded_repos:
+        body += "\nRepozytoria wyłączone z monitoringu decyzją właściciela:\n"
+        body += "\n".join(f"- {name}" for name in sorted(excluded_repos)) + "\n"
     body += "\nOgraniczenia zakresu / błędy odczytu:\n"
     body += "\n".join(f"- {repo}: {source} — {status}" for repo, source, status in sorted(set(coverage))) or "Brak błędów odczytu."
     body += ("\n\n403/404 oznacza brak dostępu, wyłączoną funkcję albo funkcję niedostępną w planie. "
@@ -358,7 +367,8 @@ def synchronize(api, owner, number, apply=False):
     project.upsert(Finding("monitor:health", "", "Stan monitoringu", "Monitoring bezpieczeństwa — stan", body, state=ACTIVE))
     # Only counts go to public workflow logs; repository names/details stay private.
     print(json.dumps({"mode": "apply" if apply else "preview", "repositories": len(repos),
-                      "items": dict(counts), "unavailable_sources": len(coverage)}, ensure_ascii=False))
+                      "items": dict(counts), "unavailable_sources": len(coverage),
+                      "excluded_repositories": len(excluded_repos)}, ensure_ascii=False))
 
 
 def main():
@@ -366,10 +376,12 @@ def main():
     parser.add_argument("--owner", default="ajsem1337")
     parser.add_argument("--project", type=int, default=1)
     parser.add_argument("--apply", action="store_true", help="Write to Project; default is read-only preview")
+    parser.add_argument("--exclude-repo", action="append", default=[], metavar="OWNER/REPO",
+                        help="Exclude a repository without dismissing its alerts; may be repeated")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") == "true" and not os.environ.get("GH_TOKEN"):
         raise RuntimeError("Dodaj sekret SECURITY_PROJECT_TOKEN w ustawieniach Actions repozytorium.")
-    synchronize(GitHub(), args.owner, args.project, args.apply)
+    synchronize(GitHub(), args.owner, args.project, args.apply, args.exclude_repo)
 
 
 if __name__ == "__main__":
@@ -379,5 +391,3 @@ if __name__ == "__main__":
         # Exceptions above deliberately contain no API payloads.
         print(str(error))
         raise SystemExit(1) from None
-
-

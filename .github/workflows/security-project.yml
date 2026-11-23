@@ -25,5 +25,4 @@ jobs:
       - name: Synchronize private project
         env:
           GH_TOKEN: ${{ secrets.SECURITY_PROJECT_TOKEN }}
-        run: python3 automation/security_project_sync.py --owner ajsem1337 --project 1 --apply
-
+        run: python3 automation/security_project_sync.py --owner ajsem1337 --project 1 --exclude-repo ajsem1337/community-plugins --apply

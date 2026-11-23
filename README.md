@@ -4,6 +4,17 @@
 
 Automatycznie zbiera aktualizacje zależności, alerty bezpieczeństwa i błędy automatyzacji z repozytoriów oraz aktualizuje ich statusy na tablicy GitHub Projects.
 
+## Zakres
+
+Nowe aktywne repozytoria właściciela są wykrywane automatycznie. Parametr
+`--exclude-repo OWNER/REPO` pozwala jawnie pominąć repozytorium bez zamykania
+lub odrzucania alertów; można go podać wielokrotnie. Wyjątki są wymieniane na
+prywatnej karcie stanu monitora, nie w publicznym logu.
+
+Decyzją właściciela harmonogram pomija nieużywany fork
+`ajsem1337/community-plugins`, zawierający cały katalog cudzych wtyczek.
+Własne `ajsem1337/system-menu` pozostaje monitorowane.
+
 ## Prywatne repozytoria
 
 Współdzielony workflow `.github/workflows/secret-check.yml` uruchamia Gitleaks,

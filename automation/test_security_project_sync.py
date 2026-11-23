@@ -84,6 +84,40 @@ class SecurityTests(unittest.TestCase):
         self.assertEqual(managed_key(item), finding.key)
         self.assertIsNone(managed_key({"content": {"body": "manual task"}, "fieldValues": {"nodes": []}}))
 
+    def test_excluded_repository_is_not_collected_or_refreshed(self):
+        api = Mock()
+        api.pages.return_value = [
+            {"full_name": "o/kept", "owner": {"login": "o"}, "archived": False, "disabled": False},
+            {"full_name": "o/excluded", "owner": {"login": "o"}, "archived": False, "disabled": False},
+        ]
+        old = {"Repozytorium": "o/excluded", "Stan źródła": OPEN}
+        item = {"fieldValues": {"nodes": [
+            {"text": value, "field": {"name": name}} for name, value in old.items()
+        ]}}
+        project = Mock()
+        project.managed = {
+            "code-scanning:o/excluded:1": item,
+            # An interrupted draft may have its marker but no custom fields yet.
+            "code-scanning:o/excluded:2": {"fieldValues": {"nodes": []}},
+        }
+        with patch("security_project_sync.Project", return_value=project), \
+                patch("security_project_sync.collect_repo", return_value=([], [])) as collect, \
+                patch("security_project_sync.refresh_missing") as refresh, \
+                patch("builtins.print") as public_log:
+            synchronize(api, "o", 1, True, excluded_repos=["O/EXCLUDED"])
+        collect.assert_called_once_with(api, api.pages.return_value[0])
+        refresh.assert_not_called()
+        project.upsert.assert_called_once()
+        health = project.upsert.call_args.args[0]
+        self.assertEqual(health.key, "monitor:health")
+        self.assertIn("decyzją właściciela", health.body)
+        self.assertIn("o/excluded", health.body)
+        self.assertNotIn("repozytorium pominięte", health.body)
+        counts = json.loads(public_log.call_args.args[0])
+        self.assertEqual(counts["repositories"], 1)
+        self.assertEqual(counts["excluded_repositories"], 1)
+        self.assertNotIn("o/excluded", public_log.call_args.args[0])
+
     def test_public_project_is_rejected_before_writes(self):
         api = Mock()
         api.gql.return_value = {"user": {"projectV2": {"public": True}}}
@@ -123,5 +157,3 @@ class SecurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
