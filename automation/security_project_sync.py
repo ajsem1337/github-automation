@@ -5,7 +5,7 @@ import base64
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import json
 import os
@@ -149,7 +149,10 @@ BAD_CONCLUSIONS = {"failure", "timed_out", "action_required", "startup_failure",
 IGNORED_CONCLUSIONS = {"cancelled", "skipped", "neutral"}
 HEALTH_KEY = "monitor:health"
 STATE_MARKER = "security-project-source-state:v1"
+STATUS_MARKER = "<!-- security-project-status:v1 -->"
+ON_TRACK, AT_RISK, OFF_TRACK = "ON_TRACK", "AT_RISK", "OFF_TRACK"
 SOURCE_STATES = ("ok", "degraded", "unavailable", "unsupported")
+SOURCE_ICONS = dict(zip(SOURCE_STATES, ("✅", "⚠️", "❌", "➖")))
 
 
 def utc_now():
@@ -400,7 +403,7 @@ PROJECT_QUERY = """query($owner:String!, $number:Int!) {
 }"""
 ITEMS_QUERY = """query($id:ID!, $cursor:String) {
   node(id:$id) { ... on ProjectV2 { items(first:100, after:$cursor) {
-    nodes { id content {
+    nodes { id isArchived updatedAt content {
       ... on DraftIssue { id title body }
       ... on PullRequest { id title url }
       ... on Issue { id title url }
@@ -410,6 +413,13 @@ ITEMS_QUERY = """query($id:ID!, $cursor:String) {
     } } }
     pageInfo { hasNextPage endCursor }
   } } }
+}"""
+STATUS_UPDATES_QUERY = """query($id:ID!) {
+  node(id:$id) { ... on ProjectV2 {
+    statusUpdates(first:1, orderBy:{field:CREATED_AT, direction:DESC}) {
+      nodes { status body createdAt }
+    }
+  } }
 }"""
 
 
@@ -437,6 +447,16 @@ def desired_status(old, state, todo=TODO, done=COMPLETE):
     return old[STATUS_FIELD]
 
 
+def overall_status(states, open_count, unverified):
+    discovery = states.get("repos")
+    if ((discovery is not None and discovery.state != "ok") or
+            any(source.state == "unavailable" for source in states.values())):
+        return OFF_TRACK
+    if open_count or unverified or any(source.state == "degraded" for source in states.values()):
+        return AT_RISK
+    return ON_TRACK
+
+
 class Project:
     def __init__(self, api, owner, number, apply=False):
         self.api, self.apply = api, apply
@@ -453,8 +473,12 @@ class Project:
             if not page["pageInfo"]["hasNextPage"]:
                 break
             cursor = page["pageInfo"]["endCursor"]
-        self.managed = {managed_key(i): i for i in self.items if managed_key(i)}
-        self.content_ids = {i["content"]["id"] for i in self.items if i.get("content")}
+        # items defaults to NOT_ARCHIVED. Also ignore archived rows defensively:
+        # terminal findings without a visible item are ignored by upsert below.
+        visible = [i for i in self.items if not i.get("isArchived")]
+        self.managed = {managed_key(i): i for i in visible if managed_key(i)}
+        self.content_ids = {i["content"]["id"] for i in visible if i.get("content")}
+        self.changed_items = set()
 
     def setup(self):
         status = self.fields.get(STATUS_FIELD, {})
@@ -478,6 +502,16 @@ class Project:
         # Keep existing manually managed PRs/issues untouched.
         if not item and finding.content_id and finding.content_id in self.content_ids:
             return "manual"
+        old = item_values(item) if item else {}
+        content = (item.get("content") or {}) if item else {}
+        values = finding.fields()
+        values[STATUS_FIELD] = desired_status(old, finding.state)
+        body_changed = (not finding.content_id and content.get("id") and
+                        (content.get("title"), content.get("body")) != (finding.title, finding.draft_body()))
+        if item and (body_changed or any(old.get(name) != value for name, value in values.items())):
+            # The loaded updatedAt is stale after a write. Track preview changes
+            # too, so reopening/changing an old card never makes it an archive candidate.
+            self.changed_items.add(item["id"])
         if not self.apply:
             return "updated" if item else "created"
         if not item:
@@ -495,14 +529,10 @@ class Project:
             created = True
         else:
             created = False
-        old = item_values(item)
-        content = item.get("content") or {}
-        if not finding.content_id and content.get("id") and (content.get("title"), content.get("body")) != (finding.title, finding.draft_body()):
+        if body_changed:
             self.api.gql("""mutation($input:UpdateProjectV2DraftIssueInput!) {
               updateProjectV2DraftIssue(input:$input) { draftIssue { id } }
             }""", input={"draftIssueId": content["id"], "title": finding.title, "body": finding.draft_body()})
-        values = finding.fields()
-        values[STATUS_FIELD] = desired_status(old, finding.state)
         for name, value in values.items():
             if old.get(name) == value:
                 continue
@@ -515,6 +545,62 @@ class Project:
         if finding.content_id:
             self.content_ids.add(finding.content_id)
         return "created" if created else "updated"
+
+    def update_status(self, status, states, open_count, unverified):
+        """Return False only when the latest status could not be read safely."""
+        if not self.apply:
+            return True
+        try:
+            updates = records(self.api.gql(STATUS_UPDATES_QUERY, id=self.id)["node"]["statusUpdates"]["nodes"])
+            latest = updates[0] if updates else None
+            if latest is not None:
+                # Missing fields are a failed read, not permission to post.
+                body, previous_status = latest["body"], latest["status"]
+                if body is not None and not isinstance(body, str):
+                    raise APIError("invalid response")
+                if STATUS_MARKER in (body or "") and previous_status == status:
+                    return True
+        except (APIError, KeyError, TypeError):
+            return False
+        sentence = {ON_TRACK: "✅ Security monitoring is on track.",
+                    AT_RISK: "⚠️ Security monitoring is at risk.",
+                    OFF_TRACK: "❌ Security monitoring is off track."}[status]
+        counts = Counter(source.state for source in states.values())
+        body = (sentence + "\n- Sources: " + ", ".join(f"{counts[s]} {s}" for s in SOURCE_STATES) + ".\n"
+                f"- Open findings observed: {open_count}; unverified: {unverified}.\n"
+                "See the **Security monitoring — health** card.\n" + STATUS_MARKER)
+        self.api.gql("""mutation($input:CreateProjectV2StatusUpdateInput!) {
+          createProjectV2StatusUpdate(input:$input) { statusUpdate { id } }
+        }""", input={"projectId": self.id, "status": status, "body": body})
+        return True
+
+    def archive_completed(self, now=None):
+        cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=30)
+        candidates = []
+        for item in self.items:
+            key = managed_key(item)
+            if (not key or source_for_key(key) is None or item.get("isArchived") or
+                    item["id"] in self.changed_items):
+                continue
+            values = item_values(item)
+            if values.get(STATUS_FIELD) != COMPLETE or values.get(SOURCE_STATE_FIELD) not in TERMINAL:
+                continue
+            try:
+                updated_at = datetime.fromisoformat(item["updatedAt"].replace("Z", "+00:00"))
+                if updated_at.utcoffset() is None or updated_at >= cutoff:
+                    continue
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+            candidates.append(item)
+            if len(candidates) == 50:
+                break
+        if self.apply:
+            for item in candidates:
+                self.api.gql("""mutation($input:ArchiveProjectV2ItemInput!) {
+                  archiveProjectV2Item(input:$input) { item { id } }
+                }""", input={"projectId": self.id, "itemId": item["id"]})
+                item["isArchived"] = True
+        return len(candidates)
 
 
 def refresh_missing(api, key):
@@ -534,27 +620,34 @@ def health_finding(states, findings, history, completed_at, repo_count, excluded
             source.last_success_at = history.get(source.source_id, "")
         history[source.source_id] = source.last_success_at
     counts = Counter(source.state for source in states.values())
-    body = "Collection health; this card does not require completion.\n\n"
-    body += f"Last completed sync: {completed_at}\n\nRepositories: {repo_count}\n\n"
-    body += "Sources: " + "; ".join(f"{state}: {counts[state]}" for state in SOURCE_STATES) + "\n\n"
     open_count = sum(f.state == OPEN for f in findings)
-    body += f"Open findings observed: {open_count}.\n"
-    if not open_count:
-        body += "No open findings observed in successfully read sources.\n"
     all_checked = all(source.state in {"ok", "unsupported"} for source in states.values())
-    body += f"All supported sources checked: {'yes' if all_checked else 'no'}.\n"
-    body += f"Unverified existing open findings: {unverified}.\n\n"
-    body += "Non-ok sources (source; state; reason; last success):\n"
-    non_ok = [source for source in states.values() if source.state != "ok"]
-    body += "\n".join(
-        f"- {source.source_id}; {source.state}; {source.reason}; {source.last_success_at or 'unknown'}"
-        for source in sorted(non_ok, key=lambda source: source.source_id)) or "None."
+    lines = ["## Summary", "", "✅ All supported sources checked" if all_checked else
+             "⚠️ Some sources could not be checked", "",
+             f"- Last completed sync: {completed_at}", f"- Repositories: {repo_count}",
+             f"- Open findings observed: {open_count}.",
+             f"- Unverified existing open findings: {unverified}."]
+    if not open_count:
+        lines.append("- No open findings observed in successfully read sources.")
+    lines += ["", "## Sources", ""]
+    lines += [f"- {SOURCE_ICONS[state]} {state}: {counts[state]}" for state in SOURCE_STATES]
+    lines += ["", "## Needs attention", ""]
+    attention = sorted((s for s in states.values() if s.state in {"degraded", "unavailable"}),
+                       key=lambda s: s.source_id)
+    lines += [f"- {SOURCE_ICONS[s.state]} `{s.source_id}` — {s.reason} — last success: "
+              f"{s.last_success_at or 'unknown'}" for s in attention] or ["None."]
+    unsupported = sorted(s.source_id for s in states.values() if s.state == "unsupported")
+    if unsupported:
+        lines += ["", "## Unsupported", ""] + [f"- ➖ `{source_id}`" for source_id in unsupported]
     if excluded_repos:
-        body += "\n\nRepositories excluded by the owner: " + ", ".join(sorted(excluded_repos))
-    body += ("\n\n403/404 means unavailable, including missing or inaccessible sources. "
-             "This does not mean there are no vulnerabilities. Failed reads preserve existing findings. "
-             "New alerts and PRs appear as separate to-do items for review. "
-             "The monitor stores metadata and links without copying secrets.\n")
+        lines += ["", "## Excluded repositories", ""] + [f"- `{repo}`" for repo in sorted(excluded_repos)]
+    lines += ["", "## Notes", "",
+              "- 403/404 means unavailable, including missing or inaccessible sources.",
+              "- This does not mean there are no vulnerabilities. Failed reads preserve existing findings.",
+              "- New alerts and PRs appear as separate to-do items for review.",
+              "- The monitor stores metadata and links without copying secrets.",
+              "- This health card does not require completion."]
+    body = "\n".join(lines) + "\n"
     body += f"\n<!-- {STATE_MARKER}\n" + json.dumps(history, sort_keys=True) + "\n-->"
     return Finding(HEALTH_KEY, "", "Monitor health", "Security monitoring — health", body, state=ACTIVE)
 
@@ -649,10 +742,15 @@ def synchronize(api, owner, number, apply=False, excluded_repos=(), unsupported_
         counts[project.upsert(finding)] += 1
     # Finalize history and publish health only after all finding writes succeeded.
     project.upsert(health_finding(states, findings, history, utc_now(), len(repos), excluded_repos, unverified))
+    open_count = sum(f.state == OPEN for f in findings)
+    status_read_failed = (not project.update_status(overall_status(states, open_count, unverified),
+                                                   states, open_count, unverified)) if apply else False
+    archived = project.archive_completed()
     # Only counts go to public workflow logs; repository names/details stay private.
     print(json.dumps({"mode": "apply" if apply else "preview", "repositories": len(repos),
                       "items": dict(counts), "sources": dict(Counter(s.state for s in states.values())),
-                      "unverified_findings": unverified, "excluded_repositories": len(excluded_repos)}))
+                      "unverified_findings": unverified, "excluded_repositories": len(excluded_repos),
+                      "status_update_read_failed": status_read_failed, "archived": archived}))
 
 
 def main():
